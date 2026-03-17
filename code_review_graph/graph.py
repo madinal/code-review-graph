@@ -287,6 +287,25 @@ class GraphStore:
             self._conn.execute("DELETE FROM node_occurrences WHERE file_path = ?", (file_path,))
             self._invalidate_cache()
 
+    def remove_directory_data(self, directory_path: str) -> int:
+        """Remove graph data for all files under a directory path."""
+        normalized = str(Path(directory_path).resolve())
+        like_pattern = f"{normalized}{Path('/')}%"
+        with self._db_lock:
+            rows = self._conn.execute(
+                """SELECT DISTINCT file_path FROM nodes
+                   WHERE file_path = ? OR file_path LIKE ?""",
+                (normalized, like_pattern),
+            ).fetchall()
+            file_paths = [row["file_path"] for row in rows]
+            for file_path in file_paths:
+                self._conn.execute("DELETE FROM nodes WHERE file_path = ?", (file_path,))
+                self._conn.execute("DELETE FROM edges WHERE file_path = ?", (file_path,))
+                self._conn.execute("DELETE FROM node_occurrences WHERE file_path = ?", (file_path,))
+            if file_paths:
+                self._invalidate_cache()
+            return len(file_paths)
+
     def store_file_nodes_edges(
         self, file_path: str, nodes: list[NodeInfo], edges: list[EdgeInfo], fhash: str = ""
     ) -> None:

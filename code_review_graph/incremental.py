@@ -548,118 +548,221 @@ def incremental_update(
 _DEBOUNCE_SECONDS = 0.3
 
 
+class _GraphWatchCoordinator:
+    """Debounce and apply filesystem events for watch mode."""
+
+    def __init__(
+        self,
+        repo_root: Path,
+        store: GraphStore,
+        parser: CodeParser,
+        ignore_patterns: list[str],
+        debounce_seconds: float = _DEBOUNCE_SECONDS,
+    ) -> None:
+        import threading
+
+        self.repo_root = repo_root
+        self.store = store
+        self.parser = parser
+        self.ignore_patterns = ignore_patterns
+        self.debounce_seconds = debounce_seconds
+        self._pending_updates: set[str] = set()
+        self._pending_removals: set[str] = set()
+        self._lock = threading.Lock()
+        self._execute_lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+
+    def handle_modified(self, abs_path: str) -> None:
+        if self._should_track_path(abs_path):
+            self._schedule_update(abs_path)
+
+    def handle_created(self, abs_path: str) -> None:
+        if self._should_track_path(abs_path):
+            self._schedule_update(abs_path)
+
+    def handle_deleted(self, abs_path: str) -> None:
+        if self._should_track_path(abs_path):
+            self._schedule_removal(abs_path)
+
+    def handle_moved(self, src_path: str, dest_path: str) -> None:
+        if self._should_track_path(src_path):
+            self._schedule_removal(src_path)
+        if self._should_track_path(dest_path):
+            self._schedule_update(dest_path)
+
+    def handle_directory_deleted(self, abs_path: str) -> None:
+        for tracked_path in self._tracked_files_in_directory(abs_path):
+            self._schedule_removal(tracked_path)
+
+    def handle_directory_created(self, abs_path: str) -> None:
+        for tracked_path in self._scan_directory_files(abs_path):
+            self._schedule_update(tracked_path)
+
+    def handle_directory_moved(self, src_path: str, dest_path: str) -> None:
+        self.handle_directory_deleted(src_path)
+        self.handle_directory_created(dest_path)
+
+    def _should_track_path(self, path: str) -> bool:
+        candidate = Path(path)
+        if candidate.is_symlink():
+            return False
+        try:
+            rel = str(candidate.relative_to(self.repo_root))
+        except ValueError:
+            return False
+        if _should_ignore(rel, self.ignore_patterns):
+            return False
+        if self.parser.detect_language(candidate) is None:
+            return False
+        return True
+
+    def _tracked_files_in_directory(self, abs_path: str) -> list[str]:
+        directory = str(Path(abs_path).resolve())
+        prefix = f"{directory}{Path('/')}"
+        return [
+            file_path for file_path in self.store.get_all_files()
+            if file_path == directory or file_path.startswith(prefix)
+        ]
+
+    def _scan_directory_files(self, abs_path: str) -> list[str]:
+        directory = Path(abs_path)
+        if not directory.exists() or not directory.is_dir():
+            return []
+
+        tracked: list[str] = []
+        for path in directory.rglob("*"):
+            if not path.is_file():
+                continue
+            if self._should_track_path(str(path)):
+                tracked.append(str(path.resolve()))
+        return tracked
+
+    def _schedule_update(self, abs_path: str) -> None:
+        with self._lock:
+            normalized = str(Path(abs_path).resolve())
+            self._pending_updates.add(normalized)
+            self._pending_removals.discard(normalized)
+            self._start_timer_locked()
+
+    def _schedule_removal(self, abs_path: str) -> None:
+        with self._lock:
+            normalized = str(Path(abs_path).resolve())
+            self._pending_updates.discard(normalized)
+            self._pending_removals.add(normalized)
+            self._start_timer_locked()
+
+    def _start_timer_locked(self) -> None:
+        import threading
+
+        if self._timer is not None:
+            self._timer.cancel()
+        self._timer = threading.Timer(self.debounce_seconds, self._flush)
+        self._timer.start()
+
+    def _flush(self) -> None:
+        with self._lock:
+            update_paths = list(self._pending_updates)
+            removal_paths = list(self._pending_removals - self._pending_updates)
+            self._pending_updates.clear()
+            self._pending_removals.clear()
+            self._timer = None
+
+        with self._execute_lock:
+            for abs_path in update_paths:
+                self._update_file(abs_path)
+
+            for abs_path in removal_paths:
+                self._remove_file(abs_path)
+
+    def _remove_file(self, abs_path: str) -> None:
+        path = Path(abs_path)
+        if path.exists():
+            return
+
+        self.store.remove_file_data(abs_path)
+        self.store.commit()
+        rel = self._relative_display_path(path)
+        logger.info("Removed: %s", rel)
+
+    def _relative_display_path(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self.repo_root))
+        except ValueError:
+            return str(path)
+
+    def _update_file(self, abs_path: str) -> None:
+        path = Path(abs_path)
+        if not path.is_file():
+            self._remove_file(abs_path)
+            return
+        if path.is_symlink():
+            return
+        try:
+            dependent_tests = {
+                str(Path(dep).resolve()) for dep in find_dependents(self.store, abs_path)
+                if dep.endswith(".py")
+            }
+            source = path.read_bytes()
+            if b"\x00" in source[:8192]:
+                return
+            fhash = hashlib.sha256(source).hexdigest()
+            self.parser.clear_caches()
+            nodes, edges = self.parser.parse_bytes(path, source)
+            self.store.store_file_nodes_edges(abs_path, nodes, edges, fhash)
+            refresh_candidates = dependent_tests | {str(path.resolve())}
+            _refresh_tested_by_edges(
+                self.repo_root, self.store, self.parser, candidate_files=refresh_candidates,
+            )
+            self.store.set_metadata(
+                "last_updated", time.strftime("%Y-%m-%dT%H:%M:%S")
+            )
+            self.store.commit()
+            rel = self._relative_display_path(path)
+            logger.info(
+                "Updated: %s (%d nodes, %d edges)",
+                rel, len(nodes), len(edges),
+            )
+        except OSError:
+            self._remove_file(abs_path)
+        except Exception as e:
+            logger.error("Error updating %s: %s", abs_path, e)
+
+
 def watch(repo_root: Path, store: GraphStore) -> None:
     """Watch for file changes and auto-update the graph.
 
     Uses a 300ms debounce to batch rapid-fire saves into a single update.
     """
-    import threading
-
     from watchdog.events import FileSystemEventHandler
     from watchdog.observers import Observer
 
     parser = CodeParser()
     ignore_patterns = _load_ignore_patterns(repo_root)
+    coordinator = _GraphWatchCoordinator(repo_root, store, parser, ignore_patterns)
 
     class GraphUpdateHandler(FileSystemEventHandler):
-        def __init__(self):
-            self._pending: set[str] = set()
-            self._lock = threading.Lock()
-            self._timer: threading.Timer | None = None
-
-        def _should_handle(self, path: str) -> bool:
-            if Path(path).is_symlink():
-                return False
-            try:
-                rel = str(Path(path).relative_to(repo_root))
-            except ValueError:
-                return False
-            if _should_ignore(rel, ignore_patterns):
-                return False
-            if parser.detect_language(Path(path)) is None:
-                return False
-            return True
-
         def on_modified(self, event):
             if event.is_directory:
                 return
-            if self._should_handle(event.src_path):
-                self._schedule(event.src_path)
+            coordinator.handle_modified(event.src_path)
 
         def on_created(self, event):
             if event.is_directory:
+                coordinator.handle_directory_created(event.src_path)
                 return
-            if self._should_handle(event.src_path):
-                self._schedule(event.src_path)
+            coordinator.handle_created(event.src_path)
 
         def on_deleted(self, event):
             if event.is_directory:
+                coordinator.handle_directory_deleted(event.src_path)
                 return
-            # Only handle files we would normally track
-            try:
-                rel = str(Path(event.src_path).relative_to(repo_root))
-            except ValueError:
-                return
-            if _should_ignore(rel, ignore_patterns):
-                return
-            store.remove_file_data(event.src_path)
-            store.commit()
-            logger.info("Removed: %s", rel)
+            coordinator.handle_deleted(event.src_path)
 
-        def _schedule(self, abs_path: str):
-            """Add file to pending set and reset the debounce timer."""
-            with self._lock:
-                self._pending.add(abs_path)
-                if self._timer is not None:
-                    self._timer.cancel()
-                self._timer = threading.Timer(
-                    _DEBOUNCE_SECONDS, self._flush
-                )
-                self._timer.start()
-
-        def _flush(self):
-            """Process all pending files after the debounce window."""
-            with self._lock:
-                paths = list(self._pending)
-                self._pending.clear()
-                self._timer = None
-
-            for abs_path in paths:
-                self._update_file(abs_path)
-
-        def _update_file(self, abs_path: str):
-            path = Path(abs_path)
-            if not path.is_file():
+        def on_moved(self, event):
+            if event.is_directory:
+                coordinator.handle_directory_moved(event.src_path, event.dest_path)
                 return
-            if path.is_symlink():
-                return
-            if _is_binary(path):
-                return
-            try:
-                dependent_tests = {
-                    dep for dep in find_dependents(store, abs_path)
-                    if dep.endswith(".py")
-                }
-                source = path.read_bytes()
-                fhash = hashlib.sha256(source).hexdigest()
-                parser.clear_caches()
-                nodes, edges = parser.parse_bytes(path, source)
-                store.store_file_nodes_edges(abs_path, nodes, edges, fhash)
-                refresh_candidates = dependent_tests | {str(path.resolve())}
-                _refresh_tested_by_edges(
-                    repo_root, store, parser, candidate_files=refresh_candidates,
-                )
-                store.set_metadata(
-                    "last_updated", time.strftime("%Y-%m-%dT%H:%M:%S")
-                )
-                store.commit()
-                rel = str(path.relative_to(repo_root))
-                logger.info(
-                    "Updated: %s (%d nodes, %d edges)",
-                    rel, len(nodes), len(edges),
-                )
-            except Exception as e:
-                logger.error("Error updating %s: %s", abs_path, e)
+            coordinator.handle_moved(event.src_path, event.dest_path)
 
     handler = GraphUpdateHandler()
     observer = Observer()

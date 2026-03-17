@@ -1,10 +1,12 @@
 """Tests for the incremental graph update module."""
 
+from pathlib import Path
 import subprocess
 from unittest.mock import MagicMock, patch
 
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
+    _GraphWatchCoordinator,
     _refresh_tested_by_edges,
     _is_binary,
     _load_ignore_patterns,
@@ -331,5 +333,198 @@ def test_refresh_tested_by_edges_falls_back_to_calls_when_ast_parse_fails(tmp_pa
         assert [edge.target_qualified for edge in tested_by_edges] == [
             f"{target_file.resolve()}::helper",
         ]
+    finally:
+        store.close()
+
+
+def test_watch_coordinator_handles_atomic_save_delete_then_move(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+    module_file = repo_root / "module.py"
+    module_file.write_text(
+        "def original():\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+
+    store = GraphStore(repo_root / "test.db")
+    try:
+        with patch("code_review_graph.incremental.get_all_tracked_files", return_value=["module.py"]):
+            full_build(repo_root, store)
+
+        tmp_save_file = repo_root / ".module.py.tmp"
+        tmp_save_file.write_text(
+            "def original():\n"
+            "    return 1\n\n"
+            "def added_via_atomic_save():\n"
+            "    return 2\n",
+            encoding="utf-8",
+        )
+        tmp_save_file.replace(module_file)
+
+        coordinator = _GraphWatchCoordinator(
+            repo_root,
+            store,
+            CodeParser(),
+            _load_ignore_patterns(repo_root),
+            debounce_seconds=999,
+        )
+        coordinator.handle_deleted(str(module_file))
+        coordinator.handle_moved(str(tmp_save_file), str(module_file))
+        coordinator._flush()
+
+        node_names = {node.name for node in store.get_nodes_by_file(str(module_file.resolve()))}
+        assert "added_via_atomic_save" in node_names
+        assert str(module_file.resolve()) in {
+            node.qualified_name for node in store.get_nodes_by_file(str(module_file.resolve()))
+        }
+    finally:
+        store.close()
+
+
+def test_watch_coordinator_handles_true_rename(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+    old_file = repo_root / "old_name.py"
+    new_file = repo_root / "new_name.py"
+    old_file.write_text(
+        "def helper():\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+
+    store = GraphStore(repo_root / "test.db")
+    try:
+        with patch("code_review_graph.incremental.get_all_tracked_files", return_value=["old_name.py"]):
+            full_build(repo_root, store)
+
+        old_file.replace(new_file)
+
+        coordinator = _GraphWatchCoordinator(
+            repo_root,
+            store,
+            CodeParser(),
+            _load_ignore_patterns(repo_root),
+            debounce_seconds=999,
+        )
+        coordinator.handle_moved(str(old_file), str(new_file))
+        coordinator._flush()
+
+        assert store.get_nodes_by_file(str(old_file.resolve())) == []
+        node_names = {node.name for node in store.get_nodes_by_file(str(new_file.resolve()))}
+        assert "helper" in node_names
+        assert str(new_file.resolve()) in {
+            node.qualified_name for node in store.get_nodes_by_file(str(new_file.resolve()))
+        }
+    finally:
+        store.close()
+
+
+def test_watch_coordinator_handles_modify_then_delete(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+    module_file = repo_root / "module.py"
+    module_file.write_text(
+        "def helper():\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+
+    store = GraphStore(repo_root / "test.db")
+    try:
+        with patch("code_review_graph.incremental.get_all_tracked_files", return_value=["module.py"]):
+            full_build(repo_root, store)
+
+        coordinator = _GraphWatchCoordinator(
+            repo_root,
+            store,
+            CodeParser(),
+            _load_ignore_patterns(repo_root),
+            debounce_seconds=999,
+        )
+        coordinator.handle_modified(str(module_file))
+        module_file.unlink()
+        coordinator.handle_deleted(str(module_file))
+        coordinator._flush()
+
+        assert store.get_nodes_by_file(str(module_file.resolve())) == []
+    finally:
+        store.close()
+
+
+def test_watch_coordinator_handles_read_failure_as_removal(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+    module_file = repo_root / "module.py"
+    module_file.write_text(
+        "def helper():\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+
+    store = GraphStore(repo_root / "test.db")
+    try:
+        with patch("code_review_graph.incremental.get_all_tracked_files", return_value=["module.py"]):
+            full_build(repo_root, store)
+
+        coordinator = _GraphWatchCoordinator(
+            repo_root,
+            store,
+            CodeParser(),
+            _load_ignore_patterns(repo_root),
+            debounce_seconds=999,
+        )
+
+        module_file.unlink()
+        path_type = type(module_file)
+        with patch.object(path_type, "read_bytes", side_effect=FileNotFoundError):
+            with patch.object(path_type, "is_file", return_value=True):
+                coordinator.handle_modified(str(module_file))
+                coordinator._flush()
+
+        assert store.get_nodes_by_file(str(module_file.resolve())) == []
+    finally:
+        store.close()
+
+
+def test_watch_coordinator_handles_directory_move(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+    old_dir = repo_root / "pkg"
+    new_dir = repo_root / "pkg2"
+    old_dir.mkdir()
+    old_file = old_dir / "mod.py"
+    old_file.write_text(
+        "def helper():\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+
+    store = GraphStore(repo_root / "test.db")
+    try:
+        with patch("code_review_graph.incremental.get_all_tracked_files", return_value=["pkg/mod.py"]):
+            full_build(repo_root, store)
+
+        old_dir.replace(new_dir)
+        new_file = new_dir / "mod.py"
+
+        coordinator = _GraphWatchCoordinator(
+            repo_root,
+            store,
+            CodeParser(),
+            _load_ignore_patterns(repo_root),
+            debounce_seconds=999,
+        )
+        coordinator.handle_directory_moved(str(old_dir), str(new_dir))
+        coordinator._flush()
+
+        assert store.get_nodes_by_file(str(old_file.resolve())) == []
+        node_names = {node.name for node in store.get_nodes_by_file(str(new_file.resolve()))}
+        assert "helper" in node_names
     finally:
         store.close()
