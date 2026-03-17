@@ -65,7 +65,8 @@ class TestCodeParser:
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_python.py")
         calls = [e for e in edges if e.kind == "CALLS"]
         call_targets = {e.target for e in calls}
-        assert "_validate_token" in call_targets
+        file_path = str((FIXTURES / "sample_python.py").resolve())
+        assert f"{file_path}::AuthService._validate_token" in call_targets
         assert "authenticate" in call_targets
 
     def test_parse_typescript_file(self):
@@ -114,11 +115,10 @@ class TestCodeParser:
         assert len(resolved_calls) == 1
 
     def test_unresolved_calls_stay_bare(self):
-        """Method calls and unknown calls should remain as bare names."""
+        """Unknown calls should remain as bare names."""
         _, edges = self.parser.parse_file(FIXTURES / "sample_python.py")
         calls = [e for e in edges if e.kind == "CALLS"]
-        # self._validate_token() is a method call — can't resolve the target file
-        bare_calls = [e for e in calls if e.target == "_validate_token"]
+        bare_calls = [e for e in calls if e.target == "print"]
         assert len(bare_calls) >= 1
 
     def test_calls_edge_decorated_function_resolution(self):
@@ -436,3 +436,42 @@ def test_absolute_imports_use_repo_source_roots_before_nested_ancestors(tmp_path
     assert "scrapy" in imports
     assert str(settings_file.resolve()) in imports
     assert str(nested_scrapy.resolve()) not in imports
+
+
+def test_self_method_calls_resolve_to_class_qualified_names(tmp_path):
+    module_file = tmp_path / "service.py"
+    module_file.write_text(
+        "class Service:\n"
+        "    def run(self):\n"
+        "        return self._helper()\n\n"
+        "    def _helper(self):\n"
+        "        return 1\n",
+        encoding="utf-8",
+    )
+
+    parser = CodeParser()
+    _, edges = parser.parse_file(module_file)
+    calls = [e for e in edges if e.kind == "CALLS"]
+
+    assert [e.target for e in calls] == [f"{module_file.resolve()}::Service._helper"]
+
+
+def test_cls_method_calls_resolve_to_class_qualified_names(tmp_path):
+    module_file = tmp_path / "factory.py"
+    module_file.write_text(
+        "class Widget:\n"
+        "    @classmethod\n"
+        "    def build(cls):\n"
+        "        return cls._construct()\n\n"
+        "    @classmethod\n"
+        "    def _construct(cls):\n"
+        "        return cls()\n",
+        encoding="utf-8",
+    )
+
+    parser = CodeParser()
+    _, edges = parser.parse_file(module_file)
+    calls = [e for e in edges if e.kind == "CALLS"]
+    targets = {e.target for e in calls}
+
+    assert f"{module_file.resolve()}::Widget._construct" in targets

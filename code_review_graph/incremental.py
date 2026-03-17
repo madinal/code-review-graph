@@ -172,7 +172,9 @@ def get_staged_and_unstaged(repo_root: Path) -> list[str]:
                 entry = line[3:].strip()
                 # Handle renamed files: "R  old -> new"
                 if " -> " in entry:
-                    entry = entry.split(" -> ", 1)[1]
+                    old_file, new_file = entry.split(" -> ", 1)
+                    files.extend([old_file.strip(), new_file.strip()])
+                    continue
                 files.append(entry)
         return files
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -314,11 +316,19 @@ def _refresh_tested_by_edges(
     repo_root: Path,
     store: GraphStore,
     parser: CodeParser,
+    candidate_files: Optional[set[str]] = None,
 ) -> int:
     """Rebuild TESTED_BY edges for Python test files."""
+    if candidate_files is None:
+        candidate_paths = {path for path in store.get_all_files()}
+    else:
+        candidate_paths = {str(Path(path).resolve()) for path in candidate_files}
+
     test_files = [
-        Path(path) for path in store.get_all_files()
-        if path.endswith(".py") and "test" in Path(path).name and ("tests" in Path(path).parts or Path(path).name.startswith("test_"))
+        Path(path) for path in candidate_paths
+        if path.endswith(".py")
+        and "test" in Path(path).name
+        and ("tests" in Path(path).parts or Path(path).name.startswith("test_"))
     ]
     if not test_files:
         return 0
@@ -328,6 +338,23 @@ def _refresh_tested_by_edges(
         try:
             tree = ast.parse(test_file.read_text())
         except (OSError, UnicodeDecodeError, SyntaxError):
+            fallback_edges = []
+            for node in store.get_nodes_by_file(str(test_file)):
+                if not node.is_test:
+                    continue
+                for edge in store.get_edges_by_source(node.qualified_name):
+                    if edge.kind == "CALLS":
+                        fallback_edges.append(
+                            EdgeInfo(
+                                kind="TESTED_BY",
+                                source=node.qualified_name,
+                                target=edge.target_qualified,
+                                file_path=str(test_file),
+                                line=0,
+                            )
+                        )
+            store.replace_edges_for_file_kind(str(test_file), "TESTED_BY", fallback_edges)
+            total_edges += len(fallback_edges)
             continue
 
         symbol_bindings, module_bindings = _build_test_bindings(parser, test_file, tree)
@@ -376,6 +403,7 @@ def _refresh_tested_by_edges(
 def full_build(repo_root: Path, store: GraphStore) -> dict:
     """Full rebuild of the entire graph."""
     parser = CodeParser()
+    parser.clear_caches()
     files = collect_all_files(repo_root)
 
     # Purge stale data from files no longer on disk
@@ -428,6 +456,7 @@ def incremental_update(
 ) -> dict:
     """Incremental update: re-parse changed + dependent files only."""
     parser = CodeParser()
+    parser.clear_caches()
     ignore_patterns = _load_ignore_patterns(repo_root)
 
     # Determine changed files
@@ -492,7 +521,10 @@ def incremental_update(
             logger.warning("Error parsing %s: %s", rel_path, e)
             errors.append({"file": rel_path, "error": str(e)})
 
-    total_edges += _refresh_tested_by_edges(repo_root, store, parser)
+    refresh_candidates = {str((repo_root / rel_path).resolve()) for rel_path in all_files}
+    total_edges += _refresh_tested_by_edges(
+        repo_root, store, parser, candidate_files=refresh_candidates,
+    )
 
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "incremental")
@@ -604,11 +636,19 @@ def watch(repo_root: Path, store: GraphStore) -> None:
             if _is_binary(path):
                 return
             try:
+                dependent_tests = {
+                    dep for dep in find_dependents(store, abs_path)
+                    if dep.endswith(".py")
+                }
                 source = path.read_bytes()
                 fhash = hashlib.sha256(source).hexdigest()
+                parser.clear_caches()
                 nodes, edges = parser.parse_bytes(path, source)
                 store.store_file_nodes_edges(abs_path, nodes, edges, fhash)
-                _refresh_tested_by_edges(repo_root, store, parser)
+                refresh_candidates = dependent_tests | {str(path.resolve())}
+                _refresh_tested_by_edges(
+                    repo_root, store, parser, candidate_files=refresh_candidates,
+                )
                 store.set_metadata(
                     "last_updated", time.strftime("%Y-%m-%dT%H:%M:%S")
                 )

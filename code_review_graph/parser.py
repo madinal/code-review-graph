@@ -204,6 +204,11 @@ class CodeParser:
         self._module_file_cache: dict[str, Optional[str]] = {}
         self._file_scope_cache: dict[tuple[str, str], tuple[dict[str, ImportBinding], set[str]]] = {}
 
+    def clear_caches(self) -> None:
+        """Reset per-build resolution caches."""
+        self._module_file_cache.clear()
+        self._file_scope_cache.clear()
+
     def _get_parser(self, language: str):  # type: ignore[arg-type]
         if language not in self._parsers:
             try:
@@ -229,11 +234,6 @@ class CodeParser:
         This avoids re-reading the file from disk, eliminating TOCTOU gaps
         when the caller has already read the bytes (e.g. for hashing).
         """
-        # Module resolution depends on the caller being parsed, so keep this
-        # cache scoped to a single parse session.
-        self._module_file_cache.clear()
-        self._file_scope_cache.clear()
-
         language = self.detect_language(path)
         if not language:
             return [], []
@@ -413,7 +413,7 @@ class CodeParser:
                     caller = self._qualify(enclosing_func, file_path, enclosing_class)
                     target = self._resolve_call_target(
                         call_ref, file_path, language,
-                        current_import_map, defined_names or set(),
+                        current_import_map, defined_names or set(), enclosing_class,
                     )
                     edges.append(EdgeInfo(
                         kind="CALLS",
@@ -815,6 +815,7 @@ class CodeParser:
         language: str,
         import_map: dict[str, ImportBinding],
         defined_names: set[str],
+        enclosing_class: Optional[str] = None,
     ) -> str:
         """Resolve a bare call name to a qualified target, with fallback."""
         leaf_name = call_ref[-1]
@@ -834,6 +835,9 @@ class CodeParser:
             return leaf_name
 
         base_name = call_ref[0]
+        if base_name in {"self", "cls", "this"} and enclosing_class:
+            return self._qualify(leaf_name, file_path, enclosing_class)
+
         binding = import_map.get(base_name)
         if not binding:
             return leaf_name

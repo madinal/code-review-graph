@@ -154,6 +154,7 @@ class GraphStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db_lock = threading.RLock()
         self._conn = sqlite3.connect(
             str(self.db_path), timeout=30, check_same_thread=False
         )
@@ -162,7 +163,6 @@ class GraphStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
         self._nxg_cache: nx.DiGraph | None = None
-        self._cache_lock = threading.Lock()
 
     def __enter__(self) -> "GraphStore":
         return self
@@ -171,209 +171,228 @@ class GraphStore:
         self.close()
 
     def _init_schema(self) -> None:
-        self._conn.executescript(_SCHEMA_SQL)
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.executescript(_SCHEMA_SQL)
+            self._conn.commit()
 
     def _invalidate_cache(self) -> None:
         """Invalidate the cached NetworkX graph after write operations."""
-        with self._cache_lock:
+        with self._db_lock:
             self._nxg_cache = None
 
     def close(self) -> None:
-        self._conn.close()
+        with self._db_lock:
+            self._conn.close()
 
     # --- Write operations ---
 
     def upsert_node(self, node: NodeInfo, file_hash: str = "") -> int:
         """Insert or update a node. Returns the node ID."""
-        now = time.time()
-        qualified = self._make_qualified(node)
-        extra = json.dumps(node.extra) if node.extra else "{}"
+        with self._db_lock:
+            now = time.time()
+            qualified = self._make_qualified(node)
+            extra = json.dumps(node.extra) if node.extra else "{}"
 
-        self._conn.execute(
-            """INSERT INTO nodes
-               (kind, name, qualified_name, file_path, line_start, line_end,
-                language, parent_name, params, return_type, modifiers, is_test,
-                file_hash, extra, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(qualified_name) DO UPDATE SET
-                 kind=excluded.kind, name=excluded.name,
-                 file_path=excluded.file_path, line_start=excluded.line_start,
-                 line_end=excluded.line_end, language=excluded.language,
-                 parent_name=excluded.parent_name, params=excluded.params,
-                 return_type=excluded.return_type, modifiers=excluded.modifiers,
-                 is_test=excluded.is_test, file_hash=excluded.file_hash,
-                 extra=excluded.extra, updated_at=excluded.updated_at
-            """,
-            (
-                node.kind, node.name, qualified, node.file_path,
-                node.line_start, node.line_end, node.language,
-                node.parent_name, node.params, node.return_type,
-                node.modifiers, int(node.is_test), file_hash,
-                extra, now,
-            ),
-        )
-        row = self._conn.execute(
-            "SELECT id FROM nodes WHERE qualified_name = ?", (qualified,)
-        ).fetchone()
-        return row["id"]
+            self._conn.execute(
+                """INSERT INTO nodes
+                   (kind, name, qualified_name, file_path, line_start, line_end,
+                    language, parent_name, params, return_type, modifiers, is_test,
+                    file_hash, extra, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(qualified_name) DO UPDATE SET
+                     kind=excluded.kind, name=excluded.name,
+                     file_path=excluded.file_path, line_start=excluded.line_start,
+                     line_end=excluded.line_end, language=excluded.language,
+                     parent_name=excluded.parent_name, params=excluded.params,
+                     return_type=excluded.return_type, modifiers=excluded.modifiers,
+                     is_test=excluded.is_test, file_hash=excluded.file_hash,
+                     extra=excluded.extra, updated_at=excluded.updated_at
+                """,
+                (
+                    node.kind, node.name, qualified, node.file_path,
+                    node.line_start, node.line_end, node.language,
+                    node.parent_name, node.params, node.return_type,
+                    node.modifiers, int(node.is_test), file_hash,
+                    extra, now,
+                ),
+            )
+            row = self._conn.execute(
+                "SELECT id FROM nodes WHERE qualified_name = ?", (qualified,)
+            ).fetchone()
+            return row["id"]
 
     def upsert_edge(self, edge: EdgeInfo) -> int:
         """Insert or update an edge."""
-        now = time.time()
-        extra = json.dumps(edge.extra) if edge.extra else "{}"
+        with self._db_lock:
+            now = time.time()
+            extra = json.dumps(edge.extra) if edge.extra else "{}"
 
-        # Check for existing edge (include line so multiple call sites are preserved)
-        existing = self._conn.execute(
-            """SELECT id FROM edges
-               WHERE kind=? AND source_qualified=? AND target_qualified=?
-                     AND file_path=? AND line=?""",
-            (edge.kind, edge.source, edge.target, edge.file_path, edge.line),
-        ).fetchone()
+            # Check for existing edge (include line so multiple call sites are preserved)
+            existing = self._conn.execute(
+                """SELECT id FROM edges
+                   WHERE kind=? AND source_qualified=? AND target_qualified=?
+                         AND file_path=? AND line=?""",
+                (edge.kind, edge.source, edge.target, edge.file_path, edge.line),
+            ).fetchone()
 
-        if existing:
+            if existing:
+                self._conn.execute(
+                    "UPDATE edges SET line=?, extra=?, updated_at=? WHERE id=?",
+                    (edge.line, extra, now, existing["id"]),
+                )
+                return existing["id"]
+
             self._conn.execute(
-                "UPDATE edges SET line=?, extra=?, updated_at=? WHERE id=?",
-                (edge.line, extra, now, existing["id"]),
+                """INSERT INTO edges
+                   (kind, source_qualified, target_qualified, file_path, line, extra, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (edge.kind, edge.source, edge.target, edge.file_path, edge.line, extra, now),
             )
-            return existing["id"]
-
-        self._conn.execute(
-            """INSERT INTO edges
-               (kind, source_qualified, target_qualified, file_path, line, extra, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (edge.kind, edge.source, edge.target, edge.file_path, edge.line, extra, now),
-        )
-        return self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            return self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
     def insert_node_occurrence(self, node: NodeInfo) -> int:
         """Insert a non-unique node occurrence used for file summaries."""
-        extra = json.dumps(node.extra) if node.extra else "{}"
-        qualified = self._make_qualified(node)
-        self._conn.execute(
-            """INSERT INTO node_occurrences
-               (kind, name, qualified_name, file_path, line_start, line_end,
-                language, parent_name, params, return_type, is_test, extra)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                node.kind, node.name, qualified, node.file_path, node.line_start,
-                node.line_end, node.language, node.parent_name, node.params,
-                node.return_type, int(node.is_test), extra,
-            ),
-        )
-        return self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self._db_lock:
+            extra = json.dumps(node.extra) if node.extra else "{}"
+            qualified = self._make_qualified(node)
+            self._conn.execute(
+                """INSERT INTO node_occurrences
+                   (kind, name, qualified_name, file_path, line_start, line_end,
+                    language, parent_name, params, return_type, is_test, extra)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    node.kind, node.name, qualified, node.file_path, node.line_start,
+                    node.line_end, node.language, node.parent_name, node.params,
+                    node.return_type, int(node.is_test), extra,
+                ),
+            )
+            return self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
     def replace_edges_for_file_kind(self, file_path: str, kind: str, edges: list[EdgeInfo]) -> None:
         """Replace all edges of a given kind for one file."""
-        self._conn.execute(
-            "DELETE FROM edges WHERE file_path = ? AND kind = ?",
-            (file_path, kind),
-        )
-        for edge in edges:
-            self.upsert_edge(edge)
-        self._invalidate_cache()
+        with self._db_lock:
+            self._conn.execute(
+                "DELETE FROM edges WHERE file_path = ? AND kind = ?",
+                (file_path, kind),
+            )
+            for edge in edges:
+                self.upsert_edge(edge)
+            self._invalidate_cache()
 
     def remove_file_data(self, file_path: str) -> None:
         """Remove all nodes and edges associated with a file."""
-        self._conn.execute("DELETE FROM nodes WHERE file_path = ?", (file_path,))
-        self._conn.execute("DELETE FROM edges WHERE file_path = ?", (file_path,))
-        self._conn.execute("DELETE FROM node_occurrences WHERE file_path = ?", (file_path,))
-        self._invalidate_cache()
+        with self._db_lock:
+            self._conn.execute("DELETE FROM nodes WHERE file_path = ?", (file_path,))
+            self._conn.execute("DELETE FROM edges WHERE file_path = ?", (file_path,))
+            self._conn.execute("DELETE FROM node_occurrences WHERE file_path = ?", (file_path,))
+            self._invalidate_cache()
 
     def store_file_nodes_edges(
         self, file_path: str, nodes: list[NodeInfo], edges: list[EdgeInfo], fhash: str = ""
     ) -> None:
         """Atomically replace all data for a file."""
-        self.remove_file_data(file_path)
-        for node in nodes:
-            self.upsert_node(node, file_hash=fhash)
-            self.insert_node_occurrence(node)
-        for edge in edges:
-            self.upsert_edge(edge)
-        self._conn.commit()
-        self._invalidate_cache()
+        with self._db_lock:
+            self.remove_file_data(file_path)
+            for node in nodes:
+                self.upsert_node(node, file_hash=fhash)
+                self.insert_node_occurrence(node)
+            for edge in edges:
+                self.upsert_edge(edge)
+            self._conn.commit()
+            self._invalidate_cache()
 
     def set_metadata(self, key: str, value: str) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, value)
-        )
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, value)
+            )
+            self._conn.commit()
 
     def get_metadata(self, key: str) -> Optional[str]:
-        row = self._conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
-        return row["value"] if row else None
+        with self._db_lock:
+            row = self._conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+            return row["value"] if row else None
 
     def commit(self) -> None:
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.commit()
 
     # --- Read operations ---
 
     def get_node(self, qualified_name: str) -> Optional[GraphNode]:
-        row = self._conn.execute(
-            "SELECT * FROM nodes WHERE qualified_name = ?", (qualified_name,)
-        ).fetchone()
-        return self._row_to_node(row) if row else None
+        with self._db_lock:
+            row = self._conn.execute(
+                "SELECT * FROM nodes WHERE qualified_name = ?", (qualified_name,)
+            ).fetchone()
+            return self._row_to_node(row) if row else None
 
     def get_nodes_by_file(self, file_path: str) -> list[GraphNode]:
-        rows = self._conn.execute(
-            "SELECT * FROM nodes WHERE file_path = ?", (file_path,)
-        ).fetchall()
-        return [self._row_to_node(r) for r in rows]
+        with self._db_lock:
+            rows = self._conn.execute(
+                "SELECT * FROM nodes WHERE file_path = ?", (file_path,)
+            ).fetchall()
+            return [self._row_to_node(r) for r in rows]
 
     def get_node_occurrences_by_file(self, file_path: str) -> list[GraphNodeOccurrence]:
-        rows = self._conn.execute(
-            """SELECT * FROM node_occurrences
-               WHERE file_path = ?
-               ORDER BY CASE WHEN kind = 'File' THEN 0 ELSE 1 END, line_start, line_end, id""",
-            (file_path,),
-        ).fetchall()
-        return [self._row_to_occurrence(r) for r in rows]
+        with self._db_lock:
+            rows = self._conn.execute(
+                """SELECT * FROM node_occurrences
+                   WHERE file_path = ?
+                   ORDER BY CASE WHEN kind = 'File' THEN 0 ELSE 1 END, line_start, line_end, id""",
+                (file_path,),
+            ).fetchall()
+            return [self._row_to_occurrence(r) for r in rows]
 
     def get_edges_by_source(self, qualified_name: str) -> list[GraphEdge]:
-        rows = self._conn.execute(
-            "SELECT * FROM edges WHERE source_qualified = ?", (qualified_name,)
-        ).fetchall()
-        return [self._row_to_edge(r) for r in rows]
+        with self._db_lock:
+            rows = self._conn.execute(
+                "SELECT * FROM edges WHERE source_qualified = ?", (qualified_name,)
+            ).fetchall()
+            return [self._row_to_edge(r) for r in rows]
 
     def get_nodes_by_qualified(self, qualified_names: list[str]) -> dict[str, GraphNode]:
         """Batch fetch nodes by qualified name."""
         if not qualified_names:
             return {}
-        unique = list(dict.fromkeys(qualified_names))
-        results: dict[str, GraphNode] = {}
-        batch_size = 450
-        for i in range(0, len(unique), batch_size):
-            batch = unique[i:i + batch_size]
-            placeholders = ",".join("?" for _ in batch)
-            rows = self._conn.execute(  # nosec B608
-                f"SELECT * FROM nodes WHERE qualified_name IN ({placeholders})",
-                batch,
-            ).fetchall()
-            for row in rows:
-                node = self._row_to_node(row)
-                results[node.qualified_name] = node
-        return results
+        with self._db_lock:
+            unique = list(dict.fromkeys(qualified_names))
+            results: dict[str, GraphNode] = {}
+            batch_size = 450
+            for i in range(0, len(unique), batch_size):
+                batch = unique[i:i + batch_size]
+                placeholders = ",".join("?" for _ in batch)
+                rows = self._conn.execute(  # nosec B608
+                    f"SELECT * FROM nodes WHERE qualified_name IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    node = self._row_to_node(row)
+                    results[node.qualified_name] = node
+            return results
 
     def get_edges_by_target(self, qualified_name: str) -> list[GraphEdge]:
-        rows = self._conn.execute(
-            "SELECT * FROM edges WHERE target_qualified = ?", (qualified_name,)
-        ).fetchall()
-        return [self._row_to_edge(r) for r in rows]
+        with self._db_lock:
+            rows = self._conn.execute(
+                "SELECT * FROM edges WHERE target_qualified = ?", (qualified_name,)
+            ).fetchall()
+            return [self._row_to_edge(r) for r in rows]
 
     def get_all_files(self) -> list[str]:
-        rows = self._conn.execute(
-            "SELECT DISTINCT file_path FROM nodes WHERE kind = 'File'"
-        ).fetchall()
-        return [r["file_path"] for r in rows]
+        with self._db_lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT file_path FROM nodes WHERE kind = 'File'"
+            ).fetchall()
+            return [r["file_path"] for r in rows]
 
     def search_nodes(self, query: str, limit: int = 20) -> list[GraphNode]:
         """Simple keyword search across node names."""
-        pattern = f"%{query}%"
-        rows = self._conn.execute(
-            "SELECT * FROM nodes WHERE name LIKE ? OR qualified_name LIKE ? LIMIT ?",
-            (pattern, pattern, limit),
-        ).fetchall()
-        return [self._row_to_node(r) for r in rows]
+        with self._db_lock:
+            pattern = f"%{query}%"
+            rows = self._conn.execute(
+                "SELECT * FROM nodes WHERE name LIKE ? OR qualified_name LIKE ? LIMIT ?",
+                (pattern, pattern, limit),
+            ).fetchall()
+            return [self._row_to_node(r) for r in rows]
 
     # --- Impact / Graph traversal ---
 
@@ -509,8 +528,9 @@ class GraphStore:
 
     def get_all_edges(self) -> list[GraphEdge]:
         """Return all edges in the graph."""
-        rows = self._conn.execute("SELECT * FROM edges").fetchall()
-        return [self._row_to_edge(r) for r in rows]
+        with self._db_lock:
+            rows = self._conn.execute("SELECT * FROM edges").fetchall()
+            return [self._row_to_edge(r) for r in rows]
 
     def get_edges_among(self, qualified_names: set[str]) -> list[GraphEdge]:
         """Return edges where both source and target are in the given set.
@@ -520,27 +540,28 @@ class GraphStore:
         """
         if not qualified_names:
             return []
-        qns = list(qualified_names)
-        results: list[GraphEdge] = []
-        batch_size = 450  # Stay well under SQLite's default 999 limit
-        for i in range(0, len(qns), batch_size):
-            batch = qns[i:i + batch_size]
-            placeholders = ",".join("?" for _ in batch)
-            rows = self._conn.execute(  # nosec B608
-                f"SELECT * FROM edges WHERE source_qualified IN ({placeholders})",
-                batch,
-            ).fetchall()
-            for r in rows:
-                edge = self._row_to_edge(r)
-                if edge.target_qualified in qualified_names:
-                    results.append(edge)
-        return results
+        with self._db_lock:
+            qns = list(qualified_names)
+            results: list[GraphEdge] = []
+            batch_size = 450  # Stay well under SQLite's default 999 limit
+            for i in range(0, len(qns), batch_size):
+                batch = qns[i:i + batch_size]
+                placeholders = ",".join("?" for _ in batch)
+                rows = self._conn.execute(  # nosec B608
+                    f"SELECT * FROM edges WHERE source_qualified IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                for r in rows:
+                    edge = self._row_to_edge(r)
+                    if edge.target_qualified in qualified_names:
+                        results.append(edge)
+            return results
 
     # --- Internal helpers ---
 
     def _build_networkx_graph(self) -> nx.DiGraph:
         """Build (or return cached) in-memory NetworkX directed graph from all edges."""
-        with self._cache_lock:
+        with self._db_lock:
             if self._nxg_cache is not None:
                 return self._nxg_cache
             g: nx.DiGraph = nx.DiGraph()

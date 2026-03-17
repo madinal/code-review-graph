@@ -311,20 +311,20 @@ def query_graph(
 
         elif pattern == "children_of":
             if node and node.kind == "File":
-                file_nodes = [
-                    candidate for candidate in store.get_nodes_by_file(node.file_path)
-                    if candidate.qualified_name != node.qualified_name
-                ]
+                file_nodes = sorted(
+                    [
+                        candidate for candidate in store.get_nodes_by_file(node.file_path)
+                        if candidate.qualified_name != node.qualified_name
+                    ],
+                    key=lambda candidate: (candidate.line_start, -candidate.line_end, candidate.id),
+                )
+                open_scopes = []
                 for candidate in file_nodes:
-                    is_nested = any(
-                        other.qualified_name != candidate.qualified_name
-                        and other.kind != "File"
-                        and other.line_start <= candidate.line_start
-                        and candidate.line_end <= other.line_end
-                        for other in file_nodes
-                    )
-                    if not is_nested:
+                    while open_scopes and candidate.line_start > open_scopes[-1].line_end:
+                        open_scopes.pop()
+                    if not open_scopes:
                         results.append(node_to_dict(candidate))
+                    open_scopes.append(candidate)
             else:
                 for e in store.get_edges_by_source(qn):
                     if e.kind == "CONTAINS":
@@ -491,7 +491,7 @@ def get_review_context(
                         if len(lines) > max_lines_per_file:
                             # Include only the relevant functions/classes
                             relevant_lines = _extract_relevant_lines(
-                                lines, impact["changed_nodes"], str(full_path)
+                                lines, impact["changed_nodes"], str(full_path), max_lines_per_file
                             )
                             snippets[rel_path] = relevant_lines
                         else:
@@ -526,19 +526,19 @@ def get_review_context(
 
 
 def _extract_relevant_lines(
-    lines: list[str], nodes: list, file_path: str
+    lines: list[str], nodes: list, file_path: str, max_lines: int
 ) -> str:
     """Extract only the lines relevant to changed nodes."""
     ranges = []
     for n in nodes:
-        if n.file_path == file_path:
+        if n.file_path == file_path and n.kind != "File":
             start = max(0, n.line_start - 3)  # 2 lines context before
             end = min(len(lines), n.line_end + 2)  # 1 line context after
             ranges.append((start, end))
 
     if not ranges:
         # Show first N lines as fallback
-        return "\n".join(f"{i+1}: {line}" for i, line in enumerate(lines[:50]))
+        return "\n".join(f"{i+1}: {line}" for i, line in enumerate(lines[:max_lines]))
 
     # Merge overlapping ranges
     ranges.sort()
@@ -550,11 +550,21 @@ def _extract_relevant_lines(
             merged.append((start, end))
 
     parts: list[str] = []
+    emitted = 0
     for start, end in merged:
+        if emitted >= max_lines:
+            break
         if parts:
             parts.append("...")
-        for i in range(start, end):
+        available = max_lines - emitted
+        if available <= 0:
+            break
+        for i in range(start, min(end, start + available)):
             parts.append(f"{i+1}: {lines[i]}")
+            emitted += 1
+        if end > start + available:
+            parts.append("...")
+            break
 
     return "\n".join(parts)
 

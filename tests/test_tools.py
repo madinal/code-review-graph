@@ -7,6 +7,7 @@ from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build, get_db_path
 from code_review_graph.parser import NodeInfo, EdgeInfo
 from code_review_graph.tools import (
+    get_review_context,
     list_graph_stats,
     query_graph,
     semantic_search_nodes,
@@ -421,3 +422,42 @@ def test_query_graph_file_summary_preserves_duplicate_definitions(tmp_path):
         "save_value",
         "save_value",
     ]
+
+
+def test_get_review_context_limits_snippets_to_relevant_non_file_ranges(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    get_db_path(repo_root)
+
+    module_file = repo_root / "module.py"
+    module_file.write_text(
+        "\n".join(
+            [f"value_{line_no} = {line_no}" for line_no in range(1, 90)]
+            + [
+                "",
+                "def important_change():",
+                "    return value_10 + value_20",
+                "",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    store = GraphStore(str(get_db_path(repo_root)))
+    full_build(repo_root, store)
+    store.close()
+
+    result = get_review_context(
+        changed_files=["module.py"],
+        max_depth=1,
+        include_source=True,
+        max_lines_per_file=8,
+        repo_root=str(repo_root),
+    )
+
+    assert result["status"] == "ok"
+    snippet = result["context"]["source_snippets"]["module.py"]
+    assert "def important_change():" in snippet
+    assert "1: value_1 = 1" not in snippet
+    assert len([line for line in snippet.splitlines() if line != "..."]) <= 8

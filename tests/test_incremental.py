@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
+    _refresh_tested_by_edges,
     _is_binary,
     _load_ignore_patterns,
     _should_ignore,
@@ -17,6 +18,7 @@ from code_review_graph.incremental import (
     get_staged_and_unstaged,
     incremental_update,
 )
+from code_review_graph.parser import CodeParser
 
 
 class TestFindRepoRoot:
@@ -158,9 +160,8 @@ class TestGitOperations:
         result = get_staged_and_unstaged(tmp_path)
         assert "src/a.py" in result
         assert "new.py" in result
+        assert "old.py" in result
         assert "new_name.py" in result
-        # old.py should NOT be in results (renamed away)
-        assert "old.py" not in result
 
     @patch("code_review_graph.incremental.subprocess.run")
     def test_get_all_tracked_files(self, mock_run, tmp_path):
@@ -236,3 +237,99 @@ class TestIncrementalUpdate:
             assert len(nodes) == 0
         finally:
             store.close()
+
+    def test_incremental_update_refreshes_only_changed_and_dependent_tests(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        app_dir = tmp_path / "app"
+        tests_dir = tmp_path / "tests"
+        app_dir.mkdir()
+        tests_dir.mkdir()
+
+        (app_dir / "helpers.py").write_text(
+            "def helper():\n"
+            "    return 1\n",
+            encoding="utf-8",
+        )
+        (tests_dir / "test_helper.py").write_text(
+            "from app.helpers import helper\n\n"
+            "def test_helper():\n"
+            "    assert helper() == 1\n",
+            encoding="utf-8",
+        )
+        (tests_dir / "test_other.py").write_text(
+            "def test_other():\n"
+            "    assert True\n",
+            encoding="utf-8",
+        )
+
+        db_path = tmp_path / "test.db"
+        store = GraphStore(db_path)
+        try:
+            with patch("code_review_graph.incremental.get_all_tracked_files", return_value=[
+                "app/helpers.py", "tests/test_helper.py", "tests/test_other.py",
+            ]):
+                full_build(tmp_path, store)
+
+            (app_dir / "helpers.py").write_text(
+                "def helper():\n"
+                "    return 2\n",
+                encoding="utf-8",
+            )
+
+            with patch("code_review_graph.incremental._refresh_tested_by_edges", return_value=0) as refresh:
+                incremental_update(tmp_path, store, changed_files=["app/helpers.py"])
+
+            refresh_candidates = refresh.call_args.kwargs["candidate_files"]
+            assert str((tmp_path / "app" / "helpers.py").resolve()) in refresh_candidates
+            assert str((tmp_path / "tests" / "test_helper.py").resolve()) in refresh_candidates
+            assert str((tmp_path / "tests" / "test_other.py").resolve()) not in refresh_candidates
+        finally:
+            store.close()
+
+
+def test_refresh_tested_by_edges_falls_back_to_calls_when_ast_parse_fails(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    get_db_path(repo_root)
+    target_file = repo_root / "lib.py"
+    test_file = repo_root / "tests" / "test_lib.py"
+    test_file.parent.mkdir()
+
+    target_file.write_text(
+        "def helper():\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+    test_file.write_text(
+        "from lib import helper\n\n"
+        "def test_helper():\n"
+        "    return helper()\n",
+        encoding="utf-8",
+    )
+
+    store = GraphStore(str(get_db_path(repo_root)))
+    try:
+        with patch("code_review_graph.incremental.get_all_tracked_files", return_value=[
+            "lib.py", "tests/test_lib.py",
+        ]):
+            full_build(repo_root, store)
+
+        parser = CodeParser()
+        with patch("code_review_graph.incremental.ast.parse", side_effect=SyntaxError):
+            edge_count = _refresh_tested_by_edges(
+                repo_root,
+                store,
+                parser,
+                candidate_files={str(test_file.resolve())},
+            )
+
+        tested_by_edges = [
+            edge for edge in store.get_edges_by_source(f"{test_file.resolve()}::test_helper")
+            if edge.kind == "TESTED_BY"
+        ]
+        assert edge_count == 1
+        assert [edge.target_qualified for edge in tested_by_edges] == [
+            f"{target_file.resolve()}::helper",
+        ]
+    finally:
+        store.close()
