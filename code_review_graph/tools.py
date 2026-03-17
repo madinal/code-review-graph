@@ -13,6 +13,7 @@ Exposes 8 tools:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,21 @@ from .incremental import (
     get_staged_and_unstaged,
     incremental_update,
 )
+
+
+def _normalize_identifier(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _to_snake_case(value: str) -> str:
+    value = re.sub(r"(?<!^)(?=[A-Z])", "_", value)
+    return re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
+
+
+def _looks_like_test_file(path: str) -> bool:
+    posix = Path(path).as_posix()
+    name = Path(path).name
+    return "/tests/" in posix or name.startswith("test_") or name.endswith("_test.py")
 
 
 def _validate_repo_root(path: Path) -> Path:
@@ -224,24 +240,36 @@ def query_graph(
         edges_out: list[dict] = []
 
         # Resolve target - try as-is, then as absolute path, then search
+        candidates = []
+        exact_non_test = []
         node = store.get_node(target)
         if not node:
             abs_target = str(root / target)
             node = store.get_node(abs_target)
         if not node:
             # Search by name
-            candidates = store.search_nodes(target, limit=5)
-            if len(candidates) == 1:
+            candidates = store.search_nodes(target, limit=50)
+            exact_non_test = [c for c in candidates if c.name == target and not c.is_test]
+            if len(exact_non_test) == 1:
+                node = exact_non_test[0]
+                target = node.qualified_name
+            elif len(candidates) == 1:
                 node = candidates[0]
                 target = node.qualified_name
-            elif len(candidates) > 1:
+            elif len(exact_non_test) > 1 and pattern != "tests_for":
+                return {
+                    "status": "ambiguous",
+                    "summary": f"Multiple matches for '{target}'. Please use a qualified name.",
+                    "candidates": [node_to_dict(c) for c in exact_non_test],
+                }
+            elif len(candidates) > 1 and pattern != "tests_for":
                 return {
                     "status": "ambiguous",
                     "summary": f"Multiple matches for '{target}'. Please use a qualified name.",
                     "candidates": [node_to_dict(c) for c in candidates],
                 }
 
-        if not node and pattern != "file_summary":
+        if not node and not candidates and pattern != "file_summary":
             return {
                 "status": "not_found",
                 "summary": f"No node found matching '{target}'.",
@@ -250,20 +278,22 @@ def query_graph(
         qn = node.qualified_name if node else target
 
         if pattern == "callers_of":
-            for e in store.get_edges_by_target(qn):
-                if e.kind == "CALLS":
-                    caller = store.get_node(e.source_qualified)
-                    if caller:
-                        results.append(node_to_dict(caller))
-                    edges_out.append(edge_to_dict(e))
+            call_edges = [e for e in store.get_edges_by_target(qn) if e.kind == "CALLS"]
+            callers = store.get_nodes_by_qualified([e.source_qualified for e in call_edges])
+            for e in call_edges:
+                caller = callers.get(e.source_qualified)
+                if caller:
+                    results.append(node_to_dict(caller))
+                edges_out.append(edge_to_dict(e))
 
         elif pattern == "callees_of":
-            for e in store.get_edges_by_source(qn):
-                if e.kind == "CALLS":
-                    callee = store.get_node(e.target_qualified)
-                    if callee:
-                        results.append(node_to_dict(callee))
-                    edges_out.append(edge_to_dict(e))
+            call_edges = [e for e in store.get_edges_by_source(qn) if e.kind == "CALLS"]
+            callees = store.get_nodes_by_qualified([e.target_qualified for e in call_edges])
+            for e in call_edges:
+                callee = callees.get(e.target_qualified)
+                if callee:
+                    results.append(node_to_dict(callee))
+                edges_out.append(edge_to_dict(e))
 
         elif pattern == "imports_of":
             for e in store.get_edges_by_source(qn):
@@ -280,39 +310,104 @@ def query_graph(
                     edges_out.append(edge_to_dict(e))
 
         elif pattern == "children_of":
-            for e in store.get_edges_by_source(qn):
-                if e.kind == "CONTAINS":
-                    child = store.get_node(e.target_qualified)
-                    if child:
-                        results.append(node_to_dict(child))
+            if node and node.kind == "File":
+                file_nodes = [
+                    candidate for candidate in store.get_nodes_by_file(node.file_path)
+                    if candidate.qualified_name != node.qualified_name
+                ]
+                for candidate in file_nodes:
+                    is_nested = any(
+                        other.qualified_name != candidate.qualified_name
+                        and other.kind != "File"
+                        and other.line_start <= candidate.line_start
+                        and candidate.line_end <= other.line_end
+                        for other in file_nodes
+                    )
+                    if not is_nested:
+                        results.append(node_to_dict(candidate))
+            else:
+                for e in store.get_edges_by_source(qn):
+                    if e.kind == "CONTAINS":
+                        child = store.get_node(e.target_qualified)
+                        if child:
+                            results.append(node_to_dict(child))
 
         elif pattern == "tests_for":
-            for e in store.get_edges_by_target(qn):
-                if e.kind == "TESTED_BY":
-                    test = store.get_node(e.source_qualified)
-                    if test:
-                        results.append(node_to_dict(test))
-            # Also search by naming convention
-            name = node.name if node else target
-            test_nodes = store.search_nodes(f"test_{name}", limit=10)
-            test_nodes += store.search_nodes(f"Test{name}", limit=10)
-            seen = {r.get("qualified_name") for r in results}
-            for t in test_nodes:
-                if t.qualified_name not in seen and t.is_test:
-                    results.append(node_to_dict(t))
+            target_candidates = [node] if node else exact_non_test
+            explicit_targets = [c.qualified_name for c in target_candidates]
+            seen = set()
+
+            def add_result(candidate) -> None:
+                if not candidate or not candidate.is_test:
+                    return
+                if candidate.qualified_name in seen:
+                    return
+                seen.add(candidate.qualified_name)
+                results.append(node_to_dict(candidate))
+
+            for target_qn in explicit_targets:
+                for e in store.get_edges_by_target(target_qn):
+                    if e.kind == "TESTED_BY":
+                        add_result(store.get_node(e.source_qualified))
+                    elif e.kind == "CALLS":
+                        add_result(store.get_node(e.source_qualified))
+
+            names = {node.name if node else target}
+
+            anchor_files: set[str] = set()
+            anchor_classes: set[tuple[str, str]] = set()
+            matched_nodes = []
+            search_terms = set()
+            for name in names:
+                snake = _to_snake_case(name)
+                search_terms.update({name, snake, snake.replace("_", "")})
+                search_terms.update({f"test_{snake}", f"Test{name}", f"{name}Test", f"{name}Tests"})
+
+            for term in search_terms:
+                if term:
+                    matched_nodes.extend(store.search_nodes(term, limit=50))
+
+            normalized_names = {_normalize_identifier(name) for name in names if name}
+            for candidate in matched_nodes:
+                norm_name = _normalize_identifier(candidate.name)
+                norm_parent = _normalize_identifier(candidate.parent_name or "")
+                norm_file = _normalize_identifier(Path(candidate.file_path).stem)
+                file_match = any(wanted and wanted in norm_file for wanted in normalized_names)
+                name_match = any(wanted and wanted in norm_name for wanted in normalized_names)
+                parent_match = any(wanted and wanted in norm_parent for wanted in normalized_names)
+                if not (file_match or name_match or parent_match):
+                    continue
+                if _looks_like_test_file(candidate.file_path):
+                    if file_match:
+                        anchor_files.add(candidate.file_path)
+                    if candidate.kind == "Class" and name_match:
+                        anchor_classes.add((candidate.file_path, candidate.name))
+                add_result(candidate)
+
+            for file_path in anchor_files:
+                for test_node in store.get_nodes_by_file(file_path):
+                    add_result(test_node)
+
+            for file_path, class_name in anchor_classes:
+                for test_node in store.get_nodes_by_file(file_path):
+                    if test_node.parent_name == class_name:
+                        add_result(test_node)
 
         elif pattern == "inheritors_of":
-            for e in store.get_edges_by_target(qn):
-                if e.kind in ("INHERITS", "IMPLEMENTS"):
-                    child = store.get_node(e.source_qualified)
-                    if child:
-                        results.append(node_to_dict(child))
-                    edges_out.append(edge_to_dict(e))
+            inheritance_edges = [
+                e for e in store.get_edges_by_target(qn)
+                if e.kind in ("INHERITS", "IMPLEMENTS")
+            ]
+            inheritors = store.get_nodes_by_qualified([e.source_qualified for e in inheritance_edges])
+            for e in inheritance_edges:
+                child = inheritors.get(e.source_qualified)
+                if child:
+                    results.append(node_to_dict(child))
+                edges_out.append(edge_to_dict(e))
 
         elif pattern == "file_summary":
             abs_path = str(root / target)
-            file_nodes = store.get_nodes_by_file(abs_path)
-            for n in file_nodes:
+            for n in store.get_node_occurrences_by_file(abs_path):
                 results.append(node_to_dict(n))
 
         return {

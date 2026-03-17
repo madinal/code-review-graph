@@ -6,6 +6,7 @@ and updates the graph accordingly. Also supports CLI invocation for hooks.
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import hashlib
 import logging
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from .graph import GraphStore
-from .parser import CodeParser
+from .parser import CodeParser, EdgeInfo
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +253,126 @@ def find_dependents(store: GraphStore, file_path: str) -> list[str]:
     return list(dependents)
 
 
+def _module_name_from_import(node: ast.ImportFrom) -> str:
+    prefix = "." * node.level
+    return f"{prefix}{node.module}" if node.module else prefix
+
+
+def _iter_test_functions(tree: ast.AST):
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+            yield None, node
+        elif isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name.startswith("test"):
+                    yield node.name, child
+
+
+def _build_test_bindings(
+    parser: CodeParser,
+    file_path: Path,
+    tree: ast.AST,
+) -> tuple[dict[str, str], dict[str, str]]:
+    symbol_bindings: dict[str, str] = {}
+    module_bindings: dict[str, str] = {}
+
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            module_name = _module_name_from_import(node)
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local_name = alias.asname or alias.name.split(".")[-1]
+                candidate_module = parser._join_module_path(module_name, alias.name)
+                resolved_candidate = parser._resolve_module_to_file(
+                    candidate_module, str(file_path), "python",
+                )
+                if resolved_candidate:
+                    module_bindings[local_name] = candidate_module
+                    continue
+
+                resolved_symbol = parser._resolve_exported_symbol(
+                    module_name, alias.name, str(file_path), "python",
+                )
+                if resolved_symbol:
+                    symbol_bindings[local_name] = resolved_symbol
+
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                module_name = alias.name
+                local_name = alias.asname or module_name.split(".", 1)[0]
+                resolved_module = parser._resolve_module_to_file(
+                    module_name, str(file_path), "python",
+                )
+                if resolved_module:
+                    module_bindings[local_name] = module_name
+
+    return symbol_bindings, module_bindings
+
+
+def _refresh_tested_by_edges(
+    repo_root: Path,
+    store: GraphStore,
+    parser: CodeParser,
+) -> int:
+    """Rebuild TESTED_BY edges for Python test files."""
+    test_files = [
+        Path(path) for path in store.get_all_files()
+        if path.endswith(".py") and "test" in Path(path).name and ("tests" in Path(path).parts or Path(path).name.startswith("test_"))
+    ]
+    if not test_files:
+        return 0
+
+    total_edges = 0
+    for test_file in test_files:
+        try:
+            tree = ast.parse(test_file.read_text())
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            continue
+
+        symbol_bindings, module_bindings = _build_test_bindings(parser, test_file, tree)
+        edge_targets: set[tuple[str, str]] = set()
+
+        for parent_class, test_func in _iter_test_functions(tree):
+            targets: set[str] = set()
+            for candidate in ast.walk(test_func):
+                if isinstance(candidate, ast.Name):
+                    target_qn = symbol_bindings.get(candidate.id)
+                    if target_qn:
+                        targets.add(target_qn)
+                elif isinstance(candidate, ast.Attribute) and isinstance(candidate.value, ast.Name):
+                    module_name = module_bindings.get(candidate.value.id)
+                    if not module_name:
+                        continue
+                    target_qn = parser._resolve_exported_symbol(
+                        module_name, candidate.attr, str(test_file), "python",
+                    )
+                    if target_qn:
+                        targets.add(target_qn)
+
+            source = (
+                f"{test_file}::{parent_class}.{test_func.name}"
+                if parent_class else f"{test_file}::{test_func.name}"
+            )
+            for target in targets:
+                edge_targets.add((source, target))
+
+        edges = [
+            EdgeInfo(
+                kind="TESTED_BY",
+                source=source,
+                target=target,
+                file_path=str(test_file),
+                line=0,
+            )
+            for source, target in sorted(edge_targets)
+        ]
+        store.replace_edges_for_file_kind(str(test_file), "TESTED_BY", edges)
+        total_edges += len(edges)
+
+    return total_edges
+
+
 def full_build(repo_root: Path, store: GraphStore) -> dict:
     """Full rebuild of the entire graph."""
     parser = CodeParser()
@@ -284,6 +405,8 @@ def full_build(repo_root: Path, store: GraphStore) -> dict:
             errors.append({"file": rel_path, "error": str(e)})
         if i % 50 == 0 or i == file_count:
             logger.info("Progress: %d/%d files parsed", i, file_count)
+
+    total_edges += _refresh_tested_by_edges(repo_root, store, parser)
 
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
@@ -368,6 +491,8 @@ def incremental_update(
         except Exception as e:
             logger.warning("Error parsing %s: %s", rel_path, e)
             errors.append({"file": rel_path, "error": str(e)})
+
+    total_edges += _refresh_tested_by_edges(repo_root, store, parser)
 
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "incremental")
@@ -483,6 +608,7 @@ def watch(repo_root: Path, store: GraphStore) -> None:
                 fhash = hashlib.sha256(source).hexdigest()
                 nodes, edges = parser.parse_bytes(path, source)
                 store.store_file_nodes_edges(abs_path, nodes, edges, fhash)
+                _refresh_tested_by_edges(repo_root, store, parser)
                 store.set_metadata(
                     "last_updated", time.strftime("%Y-%m-%dT%H:%M:%S")
                 )
@@ -509,5 +635,3 @@ def watch(repo_root: Path, store: GraphStore) -> None:
         observer.stop()
     observer.join()
     logger.info("Watch stopped.")
-
-

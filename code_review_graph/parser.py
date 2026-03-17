@@ -48,6 +48,14 @@ class EdgeInfo:
     extra: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ImportBinding:
+    """A locally bound import and the symbol/module it points to."""
+
+    module: str
+    exported_name: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Language extension mapping
 # ---------------------------------------------------------------------------
@@ -114,7 +122,7 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
 }
 
 _IMPORT_TYPES: dict[str, list[str]] = {
-    "python": ["import_statement", "import_from_statement"],
+    "python": ["import_statement", "import_from_statement", "future_import_statement"],
     "javascript": ["import_statement"],
     "typescript": ["import_statement"],
     "tsx": ["import_statement"],
@@ -194,6 +202,7 @@ class CodeParser:
     def __init__(self) -> None:
         self._parsers: dict[str, object] = {}
         self._module_file_cache: dict[str, Optional[str]] = {}
+        self._file_scope_cache: dict[tuple[str, str], tuple[dict[str, ImportBinding], set[str]]] = {}
 
     def _get_parser(self, language: str):  # type: ignore[arg-type]
         if language not in self._parsers:
@@ -220,6 +229,11 @@ class CodeParser:
         This avoids re-reading the file from disk, eliminating TOCTOU gaps
         when the caller has already read the bytes (e.g. for hashing).
         """
+        # Module resolution depends on the caller being parsed, so keep this
+        # cache scoped to a single parse session.
+        self._module_file_cache.clear()
+        self._file_scope_cache.clear()
+
         language = self.detect_language(path)
         if not language:
             return [], []
@@ -266,7 +280,7 @@ class CodeParser:
         edges: list[EdgeInfo],
         enclosing_class: Optional[str] = None,
         enclosing_func: Optional[str] = None,
-        import_map: Optional[dict[str, str]] = None,
+        import_map: Optional[dict[str, ImportBinding]] = None,
         defined_names: Optional[set[str]] = None,
     ) -> None:
         """Recursively walk the AST and extract nodes/edges."""
@@ -274,6 +288,7 @@ class CodeParser:
         func_types = set(_FUNCTION_TYPES.get(language, []))
         import_types = set(_IMPORT_TYPES.get(language, []))
         call_types = set(_CALL_TYPES.get(language, []))
+        current_import_map = dict(import_map or {})
 
         for child in root.children:
             node_type = child.type
@@ -317,7 +332,7 @@ class CodeParser:
                     self._extract_from_tree(
                         child, source, language, file_path, nodes, edges,
                         enclosing_class=name, enclosing_func=None,
-                        import_map=import_map, defined_names=defined_names,
+                        import_map=current_import_map, defined_names=defined_names,
                     )
                     continue
 
@@ -363,18 +378,29 @@ class CodeParser:
                     self._extract_from_tree(
                         child, source, language, file_path, nodes, edges,
                         enclosing_class=enclosing_class, enclosing_func=name,
-                        import_map=import_map, defined_names=defined_names,
+                        import_map=current_import_map, defined_names=defined_names,
                     )
                     continue
 
             # --- Imports ---
             if node_type in import_types:
-                imports = self._extract_import(child, language, source)
+                self._collect_import_names(child, language, source, current_import_map)
+                if language == "python" and node_type in ("import_from_statement", "future_import_statement"):
+                    imports = self._resolve_python_import_targets(
+                        child, file_path, language, source,
+                    )
+                else:
+                    imports = self._extract_import(child, language, source)
                 for imp_target in imports:
+                    resolved_target = imp_target
+                    if not (language == "python" and node_type in ("import_from_statement", "future_import_statement")):
+                        resolved_target = self._resolve_module_to_file(
+                            imp_target, file_path, language,
+                        ) or imp_target
                     edges.append(EdgeInfo(
                         kind="IMPORTS_FROM",
                         source=file_path,
-                        target=imp_target,
+                        target=resolved_target,
                         file_path=file_path,
                         line=child.start_point[0] + 1,
                     ))
@@ -382,12 +408,12 @@ class CodeParser:
 
             # --- Calls ---
             if node_type in call_types:
-                call_name = self._get_call_name(child, language, source)
-                if call_name and enclosing_func:
+                call_ref = self._get_call_reference(child, language, source)
+                if call_ref and enclosing_func:
                     caller = self._qualify(enclosing_func, file_path, enclosing_class)
                     target = self._resolve_call_target(
-                        call_name, file_path, language,
-                        import_map or {}, defined_names or set(),
+                        call_ref, file_path, language,
+                        current_import_map, defined_names or set(),
                     )
                     edges.append(EdgeInfo(
                         kind="CALLS",
@@ -401,12 +427,12 @@ class CodeParser:
             self._extract_from_tree(
                 child, source, language, file_path, nodes, edges,
                 enclosing_class=enclosing_class, enclosing_func=enclosing_func,
-                import_map=import_map, defined_names=defined_names,
+                import_map=current_import_map, defined_names=defined_names,
             )
 
     def _collect_file_scope(
         self, root, language: str, source: bytes,
-    ) -> tuple[dict[str, str], set[str]]:
+    ) -> tuple[dict[str, ImportBinding], set[str]]:
         """Pre-scan top-level AST to collect import mappings and defined names.
 
         Returns:
@@ -414,7 +440,7 @@ class CodeParser:
             to their source module/path, and defined_names is the set of
             function/class names defined at file scope.
         """
-        import_map: dict[str, str] = {}
+        import_map: dict[str, ImportBinding] = {}
         defined_names: set[str] = set()
 
         class_types = set(_CLASS_TYPES.get(language, []))
@@ -451,33 +477,54 @@ class CodeParser:
         return import_map, defined_names
 
     def _collect_import_names(
-        self, node, language: str, source: bytes, import_map: dict[str, str],
+        self, node, language: str, source: bytes, import_map: dict[str, ImportBinding],
     ) -> None:
         """Extract imported names and their source modules into import_map."""
         if language == "python":
+            seen_import_keyword = False
+            if node.type == "import_statement":
+                for child in node.children:
+                    if child.type == "dotted_name":
+                        module = child.text.decode("utf-8", errors="replace")
+                        local_name = module.split(".", 1)[0]
+                        import_map[local_name] = ImportBinding(module=module)
+                    elif child.type == "aliased_import":
+                        module = None
+                        alias = None
+                        for sub in child.children:
+                            if sub.type == "dotted_name":
+                                module = sub.text.decode("utf-8", errors="replace")
+                            elif sub.type == "identifier":
+                                alias = sub.text.decode("utf-8", errors="replace")
+                        if module and alias:
+                            import_map[alias] = ImportBinding(module=module)
+
             if node.type == "import_from_statement":
                 # from X.Y import A, B → {A: X.Y, B: X.Y}
                 module = None
                 seen_import_keyword = False
                 for child in node.children:
-                    if child.type == "dotted_name" and not seen_import_keyword:
+                    if child.type in ("dotted_name", "relative_import") and not seen_import_keyword:
                         module = child.text.decode("utf-8", errors="replace")
                     elif child.type == "import":
                         seen_import_keyword = True
                     elif seen_import_keyword and module:
                         if child.type in ("identifier", "dotted_name"):
                             name = child.text.decode("utf-8", errors="replace")
-                            import_map[name] = module
+                            import_map[name] = self._make_python_import_binding(module, name)
                         elif child.type == "aliased_import":
-                            # from X import A as B → {B: X}
-                            names = [
-                                sub.text.decode("utf-8", errors="replace")
-                                for sub in child.children
-                                if sub.type in ("identifier", "dotted_name")
-                            ]
-                            # Last name is the alias (local name)
-                            if names:
-                                import_map[names[-1]] = module
+                            imported_name = None
+                            alias = None
+                            for sub in child.children:
+                                if sub.type in ("identifier", "dotted_name"):
+                                    if imported_name is None:
+                                        imported_name = sub.text.decode("utf-8", errors="replace")
+                                    else:
+                                        alias = sub.text.decode("utf-8", errors="replace")
+                            if imported_name and alias:
+                                import_map[alias] = self._make_python_import_binding(
+                                    module, imported_name,
+                                )
 
         elif language in ("javascript", "typescript", "tsx"):
             # import { A, B } from './path' → {A: ./path, B: ./path}
@@ -491,13 +538,14 @@ class CodeParser:
                         self._collect_js_import_names(child, module, import_map)
 
     def _collect_js_import_names(
-        self, clause_node, module: str, import_map: dict[str, str],
+        self, clause_node, module: str, import_map: dict[str, ImportBinding],
     ) -> None:
         """Walk JS/TS import_clause to extract named and default imports."""
         for child in clause_node.children:
             if child.type == "identifier":
                 # Default import
-                import_map[child.text.decode("utf-8", errors="replace")] = module
+                name = child.text.decode("utf-8", errors="replace")
+                import_map[name] = ImportBinding(module=module)
             elif child.type == "named_imports":
                 for spec in child.children:
                     if spec.type == "import_specifier":
@@ -509,7 +557,163 @@ class CodeParser:
                         ]
                         # Last identifier is the local name
                         if names:
-                            import_map[names[-1]] = module
+                            import_map[names[-1]] = ImportBinding(
+                                module=module,
+                                exported_name=names[0],
+                            )
+
+    def _make_python_import_binding(self, module: str, imported_name: str) -> ImportBinding:
+        """Build a Python import binding from a module and imported name."""
+        if module.replace(".", "") == "":
+            return ImportBinding(module=f"{module}{imported_name}")
+        return ImportBinding(module=module, exported_name=imported_name)
+
+    def _get_file_scope(
+        self, file_path: str, language: str,
+    ) -> tuple[dict[str, ImportBinding], set[str]]:
+        """Return cached top-level imports and definitions for a source file."""
+        cache_key = (str(Path(file_path).resolve()), language)
+        if cache_key in self._file_scope_cache:
+            return self._file_scope_cache[cache_key]
+
+        path = Path(file_path)
+        try:
+            source = path.read_bytes()
+        except OSError:
+            scope = ({}, set())
+            self._file_scope_cache[cache_key] = scope
+            return scope
+
+        parser = self._get_parser(language)
+        if not parser:
+            scope = ({}, set())
+            self._file_scope_cache[cache_key] = scope
+            return scope
+
+        tree = parser.parse(source)
+        scope = self._collect_file_scope(tree.root_node, language, source)
+        self._file_scope_cache[cache_key] = scope
+        return scope
+
+    def _resolve_exported_symbol(
+        self,
+        module: str,
+        exported_name: str,
+        file_path: str,
+        language: str,
+        seen: Optional[set[tuple[str, str]]] = None,
+    ) -> Optional[str]:
+        """Resolve an imported symbol, following Python package re-exports."""
+        resolved = self._resolve_module_to_file(module, file_path, language)
+        if not resolved:
+            return None
+
+        if seen is None:
+            seen = set()
+
+        key = (resolved, exported_name)
+        if key in seen:
+            return None
+        seen.add(key)
+
+        import_map, defined_names = self._get_file_scope(resolved, language)
+        if exported_name in defined_names:
+            return self._qualify(exported_name, resolved, None)
+
+        rebound = import_map.get(exported_name)
+        if rebound and rebound.exported_name:
+            return self._resolve_exported_symbol(
+                rebound.module, rebound.exported_name, resolved, language, seen,
+            )
+
+        return None
+
+    def _resolve_existing_path(self, base_dir: Path, relative_path: Path) -> Optional[Path]:
+        """Resolve a relative path using exact path-component casing."""
+        current = base_dir.resolve()
+        for part in relative_path.parts:
+            if part in ("", "."):
+                continue
+            if part == "..":
+                current = current.parent
+                continue
+            try:
+                children = {child.name: child for child in current.iterdir()}
+            except OSError:
+                return None
+            current = children.get(part)
+            if current is None:
+                return None
+        return current
+
+    def _python_import_roots(self, file_path: str) -> list[Path]:
+        """Find likely Python source roots for absolute imports in a repo."""
+        caller_file = Path(file_path).resolve()
+        repo_root = None
+        for parent in caller_file.parents:
+            if (parent / ".git").exists() or (parent / ".code-review-graph").exists():
+                repo_root = parent
+                break
+
+        if repo_root is None:
+            return []
+
+        roots = []
+        for child in ("app", "src", "lib"):
+            candidate = repo_root / child
+            if candidate.is_dir():
+                roots.append(candidate)
+        roots.append(repo_root)
+
+        seen = set()
+        ordered = []
+        for root in roots:
+            resolved = root.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                ordered.append(resolved)
+        return ordered
+
+    def _resolve_python_import_targets(
+        self, node, file_path: str, language: str, source: bytes,
+    ) -> list[str]:
+        """Resolve Python ``from X import Y`` edges to local submodules when possible."""
+        imports = []
+        base_module = None
+        seen_import_keyword = False
+
+        for child in node.children:
+            if child.type in ("dotted_name", "relative_import", "__future__") and not seen_import_keyword:
+                base_module = child.text.decode("utf-8", errors="replace")
+            elif child.type == "import":
+                seen_import_keyword = True
+            elif seen_import_keyword:
+                imported_name = None
+                if child.type in ("identifier", "dotted_name"):
+                    imported_name = child.text.decode("utf-8", errors="replace")
+                elif child.type == "aliased_import":
+                    for sub in child.children:
+                        if sub.type in ("identifier", "dotted_name"):
+                            imported_name = sub.text.decode("utf-8", errors="replace")
+                            break
+
+                if imported_name and base_module:
+                    candidate = self._join_module_path(base_module, imported_name)
+                    resolved_candidate = self._resolve_module_to_file(
+                        candidate, file_path, language,
+                    )
+                    if resolved_candidate:
+                        imports.append(resolved_candidate)
+                    else:
+                        resolved_base = self._resolve_module_to_file(
+                            base_module, file_path, language,
+                        )
+                        imports.append(resolved_base or base_module)
+
+        if imports:
+            return imports
+
+        return self._extract_import(node, language, source)
 
     def _resolve_module_to_file(
         self, module: str, file_path: str, language: str,
@@ -518,7 +722,7 @@ class CodeParser:
 
         Uses self._module_file_cache to avoid repeated filesystem lookups.
         """
-        cache_key = f"{language}:{module}"
+        cache_key = f"{language}:{Path(file_path).resolve()}:{module}"
         if cache_key in self._module_file_cache:
             return self._module_file_cache[cache_key]
 
@@ -531,20 +735,56 @@ class CodeParser:
     ) -> Optional[str]:
         """Language-aware module-to-file resolution."""
         caller_dir = Path(file_path).parent
+        caller_file = Path(file_path).resolve()
 
         if language == "python":
-            rel_path = module.replace(".", "/")
-            candidates = [rel_path + ".py", rel_path + "/__init__.py"]
-            # Walk up from caller's directory to find the module file
-            current = caller_dir
-            while True:
+            leading_dots = len(module) - len(module.lstrip("."))
+            module_name = module.lstrip(".")
+
+            rel_parts = [p for p in module_name.split(".") if p]
+            candidates = []
+            if rel_parts:
+                rel_path = Path(*rel_parts)
+                candidates = [rel_path.with_suffix(".py"), rel_path / "__init__.py"]
+
+            if leading_dots:
+                current = caller_dir
+                for _ in range(max(leading_dots - 1, 0)):
+                    if current == current.parent:
+                        break
+                    current = current.parent
                 for candidate in candidates:
-                    target = current / candidate
-                    if target.is_file():
-                        return str(target.resolve())
-                if current == current.parent:
-                    break
-                current = current.parent
+                    target = self._resolve_existing_path(current, candidate)
+                    if target and target.is_file():
+                        return str(target)
+            else:
+                import_roots = self._python_import_roots(file_path)
+                if import_roots:
+                    for root in import_roots:
+                        for candidate in candidates:
+                            target = self._resolve_existing_path(root, candidate)
+                            if target and target.is_file() and target.resolve() != caller_file:
+                                return str(target)
+
+                    designated_roots = [
+                        root for root in import_roots if root.name in ("app", "src", "lib")
+                    ]
+                    if designated_roots and any(
+                        root == caller_dir or root in caller_dir.parents for root in designated_roots
+                    ):
+                        return None
+
+                # Fall back to ancestor walk when we cannot infer a repo root,
+                # or when repo-level roots do not contain the imported module.
+                current = caller_dir
+                while True:
+                    for candidate in candidates:
+                        target = self._resolve_existing_path(current, candidate)
+                        if target and target.is_file() and target.resolve() != caller_file:
+                            return str(target)
+                    if current == current.parent:
+                        break
+                    current = current.parent
 
         elif language in ("javascript", "typescript", "tsx"):
             if module.startswith("."):
@@ -570,22 +810,74 @@ class CodeParser:
 
     def _resolve_call_target(
         self,
-        call_name: str,
+        call_ref: list[str],
         file_path: str,
         language: str,
-        import_map: dict[str, str],
+        import_map: dict[str, ImportBinding],
         defined_names: set[str],
     ) -> str:
         """Resolve a bare call name to a qualified target, with fallback."""
-        if call_name in defined_names:
-            return self._qualify(call_name, file_path, None)
-        if call_name in import_map:
-            resolved = self._resolve_module_to_file(
-                import_map[call_name], file_path, language,
-            )
-            if resolved:
-                return self._qualify(call_name, resolved, None)
-        return call_name
+        leaf_name = call_ref[-1]
+
+        if len(call_ref) == 1:
+            if leaf_name in defined_names:
+                return self._qualify(leaf_name, file_path, None)
+
+            binding = import_map.get(leaf_name)
+            if binding and binding.exported_name:
+                resolved = self._resolve_exported_symbol(
+                    binding.module, binding.exported_name, file_path, language,
+                )
+                if resolved:
+                    return resolved
+
+            return leaf_name
+
+        base_name = call_ref[0]
+        binding = import_map.get(base_name)
+        if not binding:
+            return leaf_name
+
+        attribute_parts = self._trim_module_prefix(
+            binding.module, base_name, call_ref[1:],
+        )
+        if not attribute_parts:
+            return leaf_name
+
+        module = binding.module
+        if binding.exported_name:
+            module = self._join_module_path(binding.module, binding.exported_name)
+
+        resolved = self._resolve_exported_symbol(
+            module, attribute_parts[-1], file_path, language,
+        )
+        if resolved:
+            return resolved
+
+        return leaf_name
+
+    def _join_module_path(self, module: str, suffix: str) -> str:
+        """Append a child module name while preserving relative-import prefixes."""
+        if module.endswith("."):
+            return f"{module}{suffix}"
+        return f"{module}.{suffix}"
+
+    def _trim_module_prefix(
+        self, module: str, base_name: str, attribute_parts: list[str],
+    ) -> list[str]:
+        """Remove attribute segments that are part of the imported module path."""
+        if not attribute_parts:
+            return []
+
+        module_parts = [p for p in module.lstrip(".").split(".") if p]
+        if module_parts and module_parts[0] == base_name:
+            module_parts = module_parts[1:]
+
+        remaining = list(attribute_parts)
+        while module_parts and remaining and module_parts[0] == remaining[0]:
+            module_parts.pop(0)
+            remaining.pop(0)
+        return remaining
 
     def _qualify(self, name: str, file_path: str, enclosing_class: Optional[str]) -> str:
         """Create a qualified name: file_path::ClassName.name or file_path::name."""
@@ -689,15 +981,20 @@ class CodeParser:
 
         if language == "python":
             # import x.y.z  or  from x.y import z
-            if node.type == "import_from_statement":
+            if node.type in ("import_from_statement", "future_import_statement"):
                 for child in node.children:
-                    if child.type == "dotted_name":
+                    if child.type in ("dotted_name", "relative_import", "__future__"):
                         imports.append(child.text.decode("utf-8", errors="replace"))
                         break
             else:
                 for child in node.children:
                     if child.type == "dotted_name":
                         imports.append(child.text.decode("utf-8", errors="replace"))
+                    elif child.type == "aliased_import":
+                        for sub in child.children:
+                            if sub.type == "dotted_name":
+                                imports.append(sub.text.decode("utf-8", errors="replace"))
+                                break
         elif language in ("javascript", "typescript", "tsx"):
             # import ... from 'module'
             for child in node.children:
@@ -746,6 +1043,13 @@ class CodeParser:
 
     def _get_call_name(self, node, language: str, source: bytes) -> Optional[str]:
         """Extract the function/method name being called."""
+        ref = self._get_call_reference(node, language, source)
+        if ref:
+            return ref[-1]
+        return None
+
+    def _get_call_reference(self, node, language: str, source: bytes) -> Optional[list[str]]:
+        """Extract the call reference as ordered identifier parts."""
         if not node.children:
             return None
 
@@ -753,7 +1057,7 @@ class CodeParser:
 
         # Simple call: func_name(args)
         if first.type == "identifier":
-            return first.text.decode("utf-8", errors="replace")
+            return [first.text.decode("utf-8", errors="replace")]
 
         # Method call: obj.method(args)
         member_types = (
@@ -761,17 +1065,35 @@ class CodeParser:
             "field_expression", "selector_expression",
         )
         if first.type in member_types:
-            # Get the rightmost identifier (the method name)
-            for child in reversed(first.children):
-                if child.type in (
-                    "identifier", "property_identifier", "field_identifier",
-                    "field_name",
-                ):
-                    return child.text.decode("utf-8", errors="replace")
-            return first.text.decode("utf-8", errors="replace")
+            parts = self._get_reference_parts(first)
+            return parts or [first.text.decode("utf-8", errors="replace")]
 
         # Scoped call (e.g., Rust path::func())
         if first.type in ("scoped_identifier", "qualified_name"):
-            return first.text.decode("utf-8", errors="replace")
+            parts = self._get_reference_parts(first)
+            return parts or [first.text.decode("utf-8", errors="replace")]
 
         return None
+
+    def _get_reference_parts(self, node) -> list[str]:
+        """Collect ordered identifier-like parts from a dotted/scoped reference."""
+        identifier_types = (
+            "identifier", "property_identifier", "field_identifier",
+            "field_name", "type_identifier", "name",
+        )
+        nested_types = (
+            "attribute", "member_expression", "field_expression",
+            "selector_expression", "scoped_identifier", "qualified_name",
+            "nested_identifier", "dotted_name",
+        )
+
+        if node.type in identifier_types:
+            return [node.text.decode("utf-8", errors="replace")]
+
+        parts: list[str] = []
+        for child in node.children:
+            if child.type in identifier_types:
+                parts.append(child.text.decode("utf-8", errors="replace"))
+            elif child.type in nested_types:
+                parts.extend(self._get_reference_parts(child))
+        return parts

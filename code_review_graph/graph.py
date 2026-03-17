@@ -54,6 +54,22 @@ CREATE TABLE IF NOT EXISTS edges (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS node_occurrences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    line_start INTEGER,
+    line_end INTEGER,
+    language TEXT,
+    parent_name TEXT,
+    params TEXT,
+    return_type TEXT,
+    is_test INTEGER DEFAULT 0,
+    extra TEXT DEFAULT '{}'
+);
+
 CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -66,6 +82,7 @@ CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_qualified);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_qualified);
 CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_file ON edges(file_path);
+CREATE INDEX IF NOT EXISTS idx_occurrences_file ON node_occurrences(file_path);
 """
 
 
@@ -107,6 +124,23 @@ class GraphStats:
     languages: list[str]
     files_count: int
     last_updated: Optional[str]
+
+
+@dataclass
+class GraphNodeOccurrence:
+    id: int
+    kind: str
+    name: str
+    qualified_name: str
+    file_path: str
+    line_start: int
+    line_end: int
+    language: str
+    parent_name: Optional[str]
+    params: Optional[str]
+    return_type: Optional[str]
+    is_test: bool
+    extra: dict
 
 
 # ---------------------------------------------------------------------------
@@ -212,10 +246,38 @@ class GraphStore:
         )
         return self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
+    def insert_node_occurrence(self, node: NodeInfo) -> int:
+        """Insert a non-unique node occurrence used for file summaries."""
+        extra = json.dumps(node.extra) if node.extra else "{}"
+        qualified = self._make_qualified(node)
+        self._conn.execute(
+            """INSERT INTO node_occurrences
+               (kind, name, qualified_name, file_path, line_start, line_end,
+                language, parent_name, params, return_type, is_test, extra)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                node.kind, node.name, qualified, node.file_path, node.line_start,
+                node.line_end, node.language, node.parent_name, node.params,
+                node.return_type, int(node.is_test), extra,
+            ),
+        )
+        return self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def replace_edges_for_file_kind(self, file_path: str, kind: str, edges: list[EdgeInfo]) -> None:
+        """Replace all edges of a given kind for one file."""
+        self._conn.execute(
+            "DELETE FROM edges WHERE file_path = ? AND kind = ?",
+            (file_path, kind),
+        )
+        for edge in edges:
+            self.upsert_edge(edge)
+        self._invalidate_cache()
+
     def remove_file_data(self, file_path: str) -> None:
         """Remove all nodes and edges associated with a file."""
         self._conn.execute("DELETE FROM nodes WHERE file_path = ?", (file_path,))
         self._conn.execute("DELETE FROM edges WHERE file_path = ?", (file_path,))
+        self._conn.execute("DELETE FROM node_occurrences WHERE file_path = ?", (file_path,))
         self._invalidate_cache()
 
     def store_file_nodes_edges(
@@ -225,6 +287,7 @@ class GraphStore:
         self.remove_file_data(file_path)
         for node in nodes:
             self.upsert_node(node, file_hash=fhash)
+            self.insert_node_occurrence(node)
         for edge in edges:
             self.upsert_edge(edge)
         self._conn.commit()
@@ -257,11 +320,39 @@ class GraphStore:
         ).fetchall()
         return [self._row_to_node(r) for r in rows]
 
+    def get_node_occurrences_by_file(self, file_path: str) -> list[GraphNodeOccurrence]:
+        rows = self._conn.execute(
+            """SELECT * FROM node_occurrences
+               WHERE file_path = ?
+               ORDER BY CASE WHEN kind = 'File' THEN 0 ELSE 1 END, line_start, line_end, id""",
+            (file_path,),
+        ).fetchall()
+        return [self._row_to_occurrence(r) for r in rows]
+
     def get_edges_by_source(self, qualified_name: str) -> list[GraphEdge]:
         rows = self._conn.execute(
             "SELECT * FROM edges WHERE source_qualified = ?", (qualified_name,)
         ).fetchall()
         return [self._row_to_edge(r) for r in rows]
+
+    def get_nodes_by_qualified(self, qualified_names: list[str]) -> dict[str, GraphNode]:
+        """Batch fetch nodes by qualified name."""
+        if not qualified_names:
+            return {}
+        unique = list(dict.fromkeys(qualified_names))
+        results: dict[str, GraphNode] = {}
+        batch_size = 450
+        for i in range(0, len(unique), batch_size):
+            batch = unique[i:i + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(  # nosec B608
+                f"SELECT * FROM nodes WHERE qualified_name IN ({placeholders})",
+                batch,
+            ).fetchall()
+            for row in rows:
+                node = self._row_to_node(row)
+                results[node.qualified_name] = node
+        return results
 
     def get_edges_by_target(self, qualified_name: str) -> list[GraphEdge]:
         rows = self._conn.execute(
@@ -492,6 +583,23 @@ class GraphStore:
             target_qualified=row["target_qualified"],
             file_path=row["file_path"],
             line=row["line"],
+            extra=json.loads(row["extra"]) if row["extra"] else {},
+        )
+
+    def _row_to_occurrence(self, row: sqlite3.Row) -> GraphNodeOccurrence:
+        return GraphNodeOccurrence(
+            id=row["id"],
+            kind=row["kind"],
+            name=row["name"],
+            qualified_name=row["qualified_name"],
+            file_path=row["file_path"],
+            line_start=row["line_start"],
+            line_end=row["line_end"],
+            language=row["language"] or "",
+            parent_name=row["parent_name"],
+            params=row["params"],
+            return_type=row["return_type"],
+            is_test=bool(row["is_test"]),
             extra=json.loads(row["extra"]) if row["extra"] else {},
         )
 
