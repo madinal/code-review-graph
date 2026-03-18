@@ -546,6 +546,7 @@ def incremental_update(
 
 
 _DEBOUNCE_SECONDS = 0.3
+_RECONCILE_SECONDS = 1.0
 
 
 class _GraphWatchCoordinator:
@@ -568,9 +569,11 @@ class _GraphWatchCoordinator:
         self.debounce_seconds = debounce_seconds
         self._pending_updates: set[str] = set()
         self._pending_removals: set[str] = set()
+        self._file_mtimes: dict[str, int] = {}
         self._lock = threading.Lock()
         self._execute_lock = threading.Lock()
         self._timer: threading.Timer | None = None
+        self._prime_file_mtimes()
 
     def handle_modified(self, abs_path: str) -> None:
         if self._should_track_path(abs_path):
@@ -616,6 +619,14 @@ class _GraphWatchCoordinator:
             return False
         return True
 
+    def _prime_file_mtimes(self) -> None:
+        for file_path in self.store.get_all_files():
+            path = Path(file_path)
+            try:
+                self._file_mtimes[str(path.resolve())] = path.stat().st_mtime_ns
+            except OSError:
+                continue
+
     def _tracked_files_in_directory(self, abs_path: str) -> list[str]:
         directory = str(Path(abs_path).resolve())
         prefix = f"{directory}{Path('/')}"
@@ -647,8 +658,14 @@ class _GraphWatchCoordinator:
     def _schedule_removal(self, abs_path: str) -> None:
         with self._lock:
             normalized = str(Path(abs_path).resolve())
-            self._pending_updates.discard(normalized)
-            self._pending_removals.add(normalized)
+            if Path(normalized).exists():
+                # Some editors emit a stale delete event for the destination path
+                # right after an atomic replace. Keep the pending update alive.
+                self._pending_updates.add(normalized)
+                self._pending_removals.discard(normalized)
+            else:
+                self._pending_updates.discard(normalized)
+                self._pending_removals.add(normalized)
             self._start_timer_locked()
 
     def _start_timer_locked(self) -> None:
@@ -658,6 +675,33 @@ class _GraphWatchCoordinator:
             self._timer.cancel()
         self._timer = threading.Timer(self.debounce_seconds, self._flush)
         self._timer.start()
+
+    def reconcile(self) -> None:
+        tracked_files = {str(Path(path).resolve()) for path in self.store.get_all_files()}
+        should_flush = False
+        with self._lock:
+            for abs_path in tracked_files:
+                path = Path(abs_path)
+                try:
+                    mtime_ns = path.stat().st_mtime_ns
+                except OSError:
+                    self._pending_updates.discard(abs_path)
+                    self._pending_removals.add(abs_path)
+                    self._file_mtimes.pop(abs_path, None)
+                    should_flush = True
+                    continue
+
+                previous_mtime = self._file_mtimes.get(abs_path)
+                if previous_mtime is None:
+                    self._file_mtimes[abs_path] = mtime_ns
+                    continue
+                if mtime_ns != previous_mtime:
+                    self._pending_updates.add(abs_path)
+                    self._pending_removals.discard(abs_path)
+                    should_flush = True
+
+        if should_flush:
+            self._flush()
 
     def _flush(self) -> None:
         with self._lock:
@@ -679,6 +723,7 @@ class _GraphWatchCoordinator:
         if path.exists():
             return
 
+        self._file_mtimes.pop(abs_path, None)
         self.store.remove_file_data(abs_path)
         self.store.commit()
         rel = self._relative_display_path(path)
@@ -709,6 +754,7 @@ class _GraphWatchCoordinator:
             self.parser.clear_caches()
             nodes, edges = self.parser.parse_bytes(path, source)
             self.store.store_file_nodes_edges(abs_path, nodes, edges, fhash)
+            self._file_mtimes[abs_path] = path.stat().st_mtime_ns
             refresh_candidates = dependent_tests | {str(path.resolve())}
             _refresh_tested_by_edges(
                 self.repo_root, self.store, self.parser, candidate_files=refresh_candidates,
@@ -772,7 +818,12 @@ def watch(repo_root: Path, store: GraphStore) -> None:
     logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
     try:
         import time as _time
+        last_reconcile = 0.0
         while True:
+            now = _time.monotonic()
+            if now - last_reconcile >= _RECONCILE_SECONDS:
+                coordinator.reconcile()
+                last_reconcile = now
             _time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
